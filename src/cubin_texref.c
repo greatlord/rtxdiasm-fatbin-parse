@@ -1,6 +1,9 @@
 #include "rtxdiasm_cubin.h"
 #include "rtxdiasm_fatbin.h"
 
+#include <lz4.h>
+#include <zstd.h>
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -354,13 +357,31 @@ oom:
 }
 
 /* ---- fatbin/cubin selection helpers for image-level APIs ---- */
+static int decompress_cubin_payload(const unsigned char *src, size_t raw, uint64_t flags,
+                                    uint64_t uncompressed_size, unsigned char **out, size_t *out_sz){
+    *out=NULL; *out_sz=0;
+    if (uncompressed_size==0 || uncompressed_size > ((uint64_t)256<<20)) return -1;
+    unsigned char *dec = (unsigned char*)malloc((size_t)uncompressed_size);
+    if (!dec) return -1;
+    size_t got = 0;
+    if (flags & 0x8000ull){
+        size_t n = ZSTD_decompress(dec, (size_t)uncompressed_size, src, raw);
+        if (ZSTD_isError(n) || n != (size_t)uncompressed_size){ free(dec); return -1; }
+        got = n;
+    } else if (flags & 0x2000ull){
+        int n = LZ4_decompress_safe((const char*)src, (char*)dec, (int)raw, (int)uncompressed_size);
+        if (n < 0 || (size_t)n != (size_t)uncompressed_size){ free(dec); return -1; }
+        got = (size_t)n;
+    } else { free(dec); return -1; }
+    *out = dec; *out_sz = got; return 0;
+}
+
 static int extract_texrefs_from_fatbin_blob(const unsigned char *data, size_t size,
                                             const char *entry, rtxdiasm_texref_map_t *out){
     if (!(size>=16 && rd32(data)==0xBA55ED50u && rd16(data+4)==1)) return -1;
     uint64_t files_size = rd64(data+8);
     if (files_size > (uint64_t)512<<20) return -1;
     size_t pos=16, end = pos + (size_t)files_size; if (end>size) return -1;
-    /* prefer cubin containing .text.<entry> if entry given - need to peek; for now try cubins in order, prefer one yielding texrefs */
     rtxdiasm_texref_map_t best = {0};
     int found_any = 0;
     while (pos + 64 <= end){
@@ -370,23 +391,128 @@ static int extract_texrefs_from_fatbin_blob(const unsigned char *data, size_t si
         uint32_t payload_size = rd32(e+8);
         uint32_t compressed_size = rd32(e+16);
         uint64_t flags = rd64(e+40);
+        uint64_t uncompressed_size = rd64(e+56);
         if (header_size < 64 || header_size > 4096) break;
         size_t pay = pos + header_size;
         size_t disk = payload_size > compressed_size ? payload_size : compressed_size;
         if (pay > end || disk > end-pay) break;
-        if (kind == 2 && disk>0 && !(flags & (0x2000ull|0x8000ull))){
-            rtxdiasm_texref_map_t tmp = {0};
-            if (rtxdiasm_cubin_extract_texrefs(data+pay, disk, entry, &tmp)==0){
-                if (tmp.count > 0){ /* take best with results; could be refined by .text.<entry> match */ 
-                    rtxdiasm_texref_map_free(&best); best = tmp; found_any=1;
-                } else rtxdiasm_texref_map_free(&tmp);
+        if (kind == 2 && disk>0){
+            const unsigned char *cdata = data+pay; size_t csize = disk;
+            unsigned char *dec = NULL; size_t decsz = 0; int need_free = 0;
+            if (flags & (0x2000ull|0x8000ull)){
+                size_t raw = compressed_size < disk ? compressed_size : disk;
+                if (decompress_cubin_payload(data+pay, raw, flags, uncompressed_size, &dec, &decsz)==0){ cdata=dec; csize=decsz; need_free=1; }
+                else { cdata=NULL; csize=0; }
             }
+            if (cdata && csize>0){
+                rtxdiasm_texref_map_t tmp = {0};
+                if (rtxdiasm_cubin_extract_texrefs(cdata, csize, entry, &tmp)==0){
+                    if (tmp.count > 0){ rtxdiasm_texref_map_free(&best); best = tmp; found_any=1; }
+                    else rtxdiasm_texref_map_free(&tmp);
+                }
+            }
+            if (need_free) free(dec);
         }
         size_t step = header_size + disk; if (!step) break; pos += step;
     }
     if (found_any){ *out = best; return 0; }
     rtxdiasm_texref_map_free(&best);
     return -1;
+}
+
+void rtxdiasm_info_sections_free(rtxdiasm_info_sections_t *s){
+    if(!s) return;
+    for(size_t i=0;i<s->count;i++){ free(s->items[i].name); free(s->items[i].data); }
+    free(s->items); s->items=NULL; s->count=0;
+}
+void rtxdiasm_regcounts_free(rtxdiasm_regcounts_t *r){ if(!r) return; free(r->entries); r->entries=NULL; r->count=0; }
+void rtxdiasm_shared_sizes_free(rtxdiasm_shared_sizes_t *s){
+    if(!s) return;
+    for(size_t i=0;i<s->count;i++) free(s->entries[i].name);
+    free(s->entries); s->entries=NULL; s->count=0;
+}
+
+int rtxdiasm_cubin_collect_info_sections(const unsigned char *cubin, size_t size,
+                                         rtxdiasm_info_sections_t *out){
+    if(!out) return -1; out->items=NULL; out->count=0;
+    if (!rtxdiasm_is_elf_cubin(cubin,size)) return -1;
+    int is64 = cubin[4]==2; if(cubin[5]!=1) return -1;
+    shdr_t *sh=NULL; size_t shn=0; const unsigned char *shstr=NULL; size_t shstrsz=0;
+    if (parse_sections(cubin,size,is64,&sh,&shn,&shstr,&shstrsz)!=0) return -1;
+    for(size_t i=0;i<shn;i++){
+        const char *nm = sec_name(shstr,shstrsz,sh[i].name_off);
+        if (!nm || (strcmp(nm,".nv.info")!=0 && strncmp(nm,".nv.info.",9)!=0)) continue;
+        if (sh[i].offset > size || sh[i].size > size - sh[i].offset) continue;
+        rtxdiasm_info_section_t *ni = (rtxdiasm_info_section_t*)realloc(out->items,(out->count+1)*sizeof(*ni));
+        if(!ni){ rtxdiasm_info_sections_free(out); free(sh); return -1; }
+        out->items = ni; memset(&ni[out->count],0,sizeof(*ni));
+        ni[out->count].name = (char*)malloc(strlen(nm)+1);
+        ni[out->count].data = (unsigned char*)malloc(sh[i].size ? (size_t)sh[i].size : 1);
+        if(!ni[out->count].name || !ni[out->count].data){ free(ni[out->count].name); free(ni[out->count].data); rtxdiasm_info_sections_free(out); free(sh); return -1; }
+        strcpy(ni[out->count].name,nm);
+        if(sh[i].size) memcpy(ni[out->count].data, cubin + (size_t)sh[i].offset, (size_t)sh[i].size);
+        ni[out->count].size = (size_t)sh[i].size;
+        out->count++;
+    }
+    free(sh); return 0;
+}
+
+int rtxdiasm_cubin_extract_regcounts(const unsigned char *cubin, size_t size,
+                                     rtxdiasm_regcounts_t *out){
+    if(!out) return -1; out->entries=NULL; out->count=0;
+    rtxdiasm_info_sections_t infos={0};
+    if (rtxdiasm_cubin_collect_info_sections(cubin,size,&infos)!=0) return -1;
+    for(size_t i=0;i<infos.count;i++){
+        const char *nm = infos.items[i].name ? infos.items[i].name : "";
+        int globalInfo = (strcmp(nm,".nv.info")==0);
+        const unsigned char *d = infos.items[i].data; size_t sz = infos.items[i].size;
+        size_t off=0;
+        while(off+4 <= sz){
+            unsigned char format=d[off]; unsigned char attr=d[off+1];
+            uint16_t value = (uint16_t)(d[off+2] | ((uint16_t)d[off+3]<<8));
+            size_t recsz;
+            if (format==1 || format==2 || format==3) recsz=4;
+            else if (format==4) recsz=4u + value;
+            else break;
+            if (off+recsz > sz) break;
+            if (format==4 && attr==0x2f && value >= 8){
+                uint32_t symidx = rd32(d+off+4);
+                uint32_t regc = rd32(d+off+8);
+                /* per-function exact overrides aggregate */
+                int found=-1;
+                for(size_t k=0;k<out->count;k++) if(out->entries[k].symbol_index==symidx){ found=(int)k; break; }
+                if (found>=0){ if(!globalInfo) out->entries[found].regcount = regc; }
+                else {
+                    rtxdiasm_regcount_entry_t *ne=(rtxdiasm_regcount_entry_t*)realloc(out->entries,(out->count+1)*sizeof(*ne));
+                    if(!ne){ rtxdiasm_regcounts_free(out); rtxdiasm_info_sections_free(&infos); return -1; }
+                    out->entries=ne; ne[out->count].symbol_index=symidx; ne[out->count].regcount=regc; out->count++;
+                }
+            }
+            off += recsz;
+        }
+    }
+    rtxdiasm_info_sections_free(&infos);
+    return 0;
+}
+
+int rtxdiasm_cubin_collect_shared_sizes(const unsigned char *cubin, size_t size,
+                                        rtxdiasm_shared_sizes_t *out){
+    if(!out) return -1; out->entries=NULL; out->count=0;
+    if (!rtxdiasm_is_elf_cubin(cubin,size)) return -1;
+    int is64 = cubin[4]==2; if(cubin[5]!=1) return -1;
+    shdr_t *sh=NULL; size_t shn=0; const unsigned char *shstr=NULL; size_t shstrsz=0;
+    if (parse_sections(cubin,size,is64,&sh,&shn,&shstr,&shstrsz)!=0) return -1;
+    for(size_t i=0;i<shn;i++){
+        const char *nm = sec_name(shstr,shstrsz,sh[i].name_off);
+        if (!nm || strncmp(nm,".nv.shared",10)!=0) continue;
+        rtxdiasm_shared_entry_t *ne=(rtxdiasm_shared_entry_t*)realloc(out->entries,(out->count+1)*sizeof(*ne));
+        if(!ne){ rtxdiasm_shared_sizes_free(out); free(sh); return -1; }
+        out->entries=ne; memset(&ne[out->count],0,sizeof(*ne));
+        ne[out->count].name=(char*)malloc(strlen(nm)+1);
+        if(!ne[out->count].name){ rtxdiasm_shared_sizes_free(out); free(sh); return -1; }
+        strcpy(ne[out->count].name,nm); ne[out->count].size = sh[i].size; out->count++;
+    }
+    free(sh); return 0;
 }
 
 int rtxdiasm_image_extract_texrefs(const unsigned char *data, size_t size,
