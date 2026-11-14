@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-/* Texture ref map extracted from cubin .nv.constant0 relocations (C#-style). */
+/* ---- Texrefs (.nv.constant0 relocations, C# ExtractTextureRefs) ---- */
 typedef struct rtxdiasm_texref_entry {
     int descriptor_index; /* relocation offset / 4 (SASS TLD/TLDS immediate) */
     char *name;           /* texture symbol name, malloc'd */
@@ -21,37 +21,60 @@ typedef struct rtxdiasm_texref_map {
 
 void rtxdiasm_texref_map_free(rtxdiasm_texref_map_t *map);
 
-/*
- * Extract texref descriptor->symbol mapping from a cubin ELF image, mirroring
- * C# RtxDisamApi.ExtractTextureRefs:
- * - prefer .nv.constant0.<entry> when entry is provided/non-empty
- * - otherwise .nv.constant0, or the sole .nv.constant0.* section
- * - for each relocation with symbol name and offset%4==0: map[offset/4]=symbol
- *
- * Returns 0 on success (map may be empty). Returns -1 on parse error.
- */
 int rtxdiasm_cubin_extract_texrefs(const unsigned char *cubin, size_t size,
                                    const char *entry,
                                    rtxdiasm_texref_map_t *out);
 
-/*
- * Extract texrefs from a fatbin or cubin image (C# LoadCubinForEntry +
- * ExtractTextureRefs behavior for selection). If data is ELF cubin, parses it.
- * If data is a fatbin (wrapper/BA55ED50 blob), selects a cubin entry matching
- * entry (.text.<entry>) when possible, else first cubin.
- * Returns 0 on success, -1 if no suitable cubin/texrefs context.
- */
 int rtxdiasm_image_extract_texrefs(const unsigned char *data, size_t size,
                                    const char *entry,
                                    rtxdiasm_texref_map_t *out);
 
-/*
- * Surface refs (.surfref) are synthesized during SASS->PTX lift from surface
- * instructions (C# SassToPtx: SULD/SUST/SURED/SUQ), not stored as named
- * cubin symbols. C# naming: "__surf_{bank}_{index}" where (bank,index) are the
- * descriptor immediates of the instruction.
- */
+/* ---- Constant bank globals/images (C# ExtractConstantBankGlobals) ---- */
+/* Materializes c[bank][offset] slots relocated against module data symbols. */
+typedef struct rtxdiasm_global_image {
+    int offset;        /* relocation offset in constant bank section */
+    char *name;        /* symbol name, malloc'd */
+    long long addend;  /* relocation addend */
+    unsigned char *data; /* copied bytes (size = image_size), malloc'd */
+    size_t size;
+} rtxdiasm_global_image_t;
+
+typedef struct rtxdiasm_global_image_map {
+    rtxdiasm_global_image_t *entries;
+    size_t count;
+} rtxdiasm_global_image_map_t;
+
+void rtxdiasm_global_image_map_free(rtxdiasm_global_image_map_t *map);
+
+/* ---- Section/blob results ---- */
+typedef struct rtxdiasm_blob {
+    unsigned char *data; /* malloc'd copy */
+    size_t size;
+} rtxdiasm_blob_t;
+
+void rtxdiasm_blob_free(rtxdiasm_blob_t *b);
+
+/* ---- Constant banks (C# ExtractConstantBank) ---- */
+/* Returns malloc'd copy of .nv.constant{bank}(.<entry>) data, or -1 if not found. */
+int rtxdiasm_cubin_extract_constant_bank(const unsigned char *cubin, size_t size,
+                                         const char *entry, int bank,
+                                         rtxdiasm_blob_t *out);
+
+/* Constant bank globals for a bank (e.g. 4), C# ExtractConstantBankGlobals. */
+int rtxdiasm_cubin_extract_constant_bank_globals(const unsigned char *cubin, size_t size,
+                                                 const char *entry, int bank,
+                                                 rtxdiasm_global_image_map_t *out);
+
+/* ---- Surface refs (.surfref, C# SassToPtx) ---- */
+/* Surfrefs are synthesized during SASS lift from SULD/SUST/SURED/SUQ as
+ * __surf_{bank}_{index}; this formats the canonical name. */
 void rtxdiasm_format_surfref_name(char *buf, size_t buf_size, int bank, int index);
+
+/* ---- Fatbin/cubin helpers ---- */
+/* 1 if data begins with ELF magic. */
+int rtxdiasm_is_elf_cubin(const unsigned char *data, size_t size);
+/* 1 if data looks like a fatbin (wrapper 0x466243B1 or data blob 0xBA55ED50). */
+int rtxdiasm_is_fatbin(const unsigned char *data, size_t size);
 
 #ifdef __cplusplus
 }
