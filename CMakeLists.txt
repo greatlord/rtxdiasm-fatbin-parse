@@ -9,6 +9,7 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 add_library(rtxdiasm_fatbin_parse STATIC
   src/fatbin_parse.c
+  src/cubin_texref.c
 )
 
 target_include_directories(rtxdiasm_fatbin_parse
