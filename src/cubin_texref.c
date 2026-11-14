@@ -434,7 +434,8 @@ void rtxdiasm_shared_sizes_free(rtxdiasm_shared_sizes_t *s){
 
 int rtxdiasm_cubin_collect_info_sections(const unsigned char *cubin, size_t size,
                                          rtxdiasm_info_sections_t *out){
-    if(!out) return -1; out->items=NULL; out->count=0;
+    if(!out) return -1;
+    out->items=NULL; out->count=0;
     if (!rtxdiasm_is_elf_cubin(cubin,size)) return -1;
     int is64 = cubin[4]==2; if(cubin[5]!=1) return -1;
     shdr_t *sh=NULL; size_t shn=0; const unsigned char *shstr=NULL; size_t shstrsz=0;
@@ -459,7 +460,8 @@ int rtxdiasm_cubin_collect_info_sections(const unsigned char *cubin, size_t size
 
 int rtxdiasm_cubin_extract_regcounts(const unsigned char *cubin, size_t size,
                                      rtxdiasm_regcounts_t *out){
-    if(!out) return -1; out->entries=NULL; out->count=0;
+    if(!out) return -1;
+    out->entries=NULL; out->count=0;
     rtxdiasm_info_sections_t infos={0};
     if (rtxdiasm_cubin_collect_info_sections(cubin,size,&infos)!=0) return -1;
     for(size_t i=0;i<infos.count;i++){
@@ -497,7 +499,8 @@ int rtxdiasm_cubin_extract_regcounts(const unsigned char *cubin, size_t size,
 
 int rtxdiasm_cubin_collect_shared_sizes(const unsigned char *cubin, size_t size,
                                         rtxdiasm_shared_sizes_t *out){
-    if(!out) return -1; out->entries=NULL; out->count=0;
+    if(!out) return -1;
+    out->entries=NULL; out->count=0;
     if (!rtxdiasm_is_elf_cubin(cubin,size)) return -1;
     int is64 = cubin[4]==2; if(cubin[5]!=1) return -1;
     shdr_t *sh=NULL; size_t shn=0; const unsigned char *shstr=NULL; size_t shstrsz=0;
